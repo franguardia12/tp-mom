@@ -10,6 +10,8 @@ from .middleware import (
 
 
 _DEFAULT_EXCHANGE = ""
+_DIRECT_EXCHANGE = "direct"
+_EXCHANGE_DURABLE = True
 _PREFETCH_COUNT = 1
 _QUEUE_DURABLE = True
 _REQUEUE_REJECTED_MESSAGES = True
@@ -122,6 +124,23 @@ class _MessageMiddlewareRabbitMQ:
                 "Could not close the RabbitMQ middleware cleanly"
             ) from close_error
 
+    def _publish_message(self, exchange_name, routing_key, message):
+        self._ensure_connection_is_open()
+
+        try:
+            self._channel.basic_publish(
+                exchange=exchange_name,
+                routing_key=routing_key,
+                body=message,
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+                ),
+            )
+        except _CONNECTION_ERRORS as error:
+            self._raise_disconnected(error)
+        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+            self._raise_message_error("Could not publish the message", error)
+
     def _build_message_callback(self, on_message_callback):
         def callback(channel, method, _properties, body):
             delivery_tag = method.delivery_tag
@@ -212,24 +231,86 @@ class MessageMiddlewareQueueRabbitMQ(
             self._raise_message_error("Could not declare the queue", error)
 
     def send(self, message):
-        self._ensure_connection_is_open()
+        self._publish_message(_DEFAULT_EXCHANGE, self._queue_name, message)
+
+
+class MessageMiddlewareExchangeRabbitMQ(
+    _MessageMiddlewareRabbitMQ,
+    MessageMiddlewareExchange,
+):
+
+    def __init__(self, host, exchange_name, routing_keys):
+        if isinstance(routing_keys, (str, bytes)):
+            raise MessageMiddlewareMessageError(
+                "Routing keys must be an iterable of strings"
+            )
 
         try:
-            self._channel.basic_publish(
-                exchange=_DEFAULT_EXCHANGE,
-                routing_key=self._queue_name,
-                body=message,
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
-                ),
+            routing_keys = tuple(dict.fromkeys(routing_keys))
+        except (TypeError, ValueError) as error:
+            raise MessageMiddlewareMessageError(
+                "Routing keys must be an iterable of strings"
+            ) from error
+
+        if any(
+            not isinstance(routing_key, str) or not routing_key
+            for routing_key in routing_keys
+        ):
+            raise MessageMiddlewareMessageError(
+                "Routing keys must be non-empty strings"
             )
+
+        super().__init__(host)
+        self._exchange_name = exchange_name
+        self._routing_keys = routing_keys
+
+        try:
+            self._channel.exchange_declare(
+                exchange=exchange_name,
+                exchange_type=_DIRECT_EXCHANGE,
+                durable=_EXCHANGE_DURABLE,
+            )
+        except _CONNECTION_ERRORS as error:
+            self._cleanup_after_setup_failure(error)
+            self._raise_disconnected(error)
+        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+            self._cleanup_after_setup_failure(error)
+            self._raise_message_error("Could not declare the exchange", error)
+
+    def start_consuming(self, on_message_callback):
+        self._declare_consumer_queue()
+        super().start_consuming(on_message_callback)
+
+    def send(self, message):
+        for routing_key in self._routing_keys:
+            self._publish_message(self._exchange_name, routing_key, message)
+
+    def _declare_consumer_queue(self):
+        if self._consumer_queue_name is not None:
+            return
+
+        self._ensure_connection_is_open()
+        try:
+            result = self._channel.queue_declare(
+                queue="",
+                durable=False,
+                exclusive=True,
+                auto_delete=False,
+            )
+            queue_name = result.method.queue
+
+            for routing_key in self._routing_keys:
+                self._channel.queue_bind(
+                    exchange=self._exchange_name,
+                    queue=queue_name,
+                    routing_key=routing_key,
+                )
+
+            self._channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
+            self._consumer_queue_name = queue_name
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
         except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
-            self._raise_message_error("Could not publish the message", error)
-
-
-class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
-
-    def __init__(self, host, exchange_name, routing_keys):
-        pass
+            self._raise_message_error(
+                "Could not configure the exchange consumer", error
+            )
