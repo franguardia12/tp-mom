@@ -8,14 +8,6 @@ from .middleware import (
     MessageMiddlewareQueue,
 )
 
-
-_DEFAULT_EXCHANGE = ""
-_DIRECT_EXCHANGE = "direct"
-_EXCHANGE_DURABLE = True
-_PREFETCH_COUNT = 1
-_QUEUE_DURABLE = True
-_REQUEUE_REJECTED_MESSAGES = True
-
 _CONNECTION_ERRORS = (
     pika.exceptions.AMQPConnectionError,
     pika.exceptions.ConnectionClosed,
@@ -189,7 +181,7 @@ class _MessageMiddlewareRabbitMQ:
         try:
             channel.basic_nack(
                 delivery_tag=delivery_tag,
-                requeue=_REQUEUE_REJECTED_MESSAGES,
+                requeue=True,
             )
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
@@ -249,9 +241,9 @@ class MessageMiddlewareQueueRabbitMQ(
         try:
             self._channel.queue_declare(
                 queue=queue_name,
-                durable=_QUEUE_DURABLE,
+                durable=True,
             )
-            self._channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
+            self._channel.basic_qos(prefetch_count=1)
         except _CONNECTION_ERRORS as error:
             self._cleanup_after_setup_failure(error)
             self._raise_disconnected(error)
@@ -260,7 +252,7 @@ class MessageMiddlewareQueueRabbitMQ(
             self._raise_message_error("Could not declare the queue", error)
 
     def send(self, message):
-        self._publish_message(_DEFAULT_EXCHANGE, self._queue_name, message)
+        self._publish_message("", self._queue_name, message)
 
 
 class MessageMiddlewareExchangeRabbitMQ(
@@ -296,8 +288,8 @@ class MessageMiddlewareExchangeRabbitMQ(
         try:
             self._channel.exchange_declare(
                 exchange=exchange_name,
-                exchange_type=_DIRECT_EXCHANGE,
-                durable=_EXCHANGE_DURABLE,
+                exchange_type="direct",
+                durable=True,
             )
         except _CONNECTION_ERRORS as error:
             self._cleanup_after_setup_failure(error)
@@ -336,7 +328,7 @@ class MessageMiddlewareExchangeRabbitMQ(
                     routing_key=routing_key,
                 )
 
-            self._channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
+            self._channel.basic_qos(prefetch_count=1)
             self._consumer_queue_name = queue_name
         except _CONNECTION_ERRORS as error:
             self._cleanup_after_setup_failure(error)
