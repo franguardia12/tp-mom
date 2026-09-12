@@ -23,6 +23,10 @@ _CONNECTION_ERRORS = (
 )
 
 
+class _CallbackError(Exception):
+    """Keep application exceptions separate from communication failures."""
+
+
 class _MessageMiddlewareRabbitMQ:
     """Common RabbitMQ connection and consumption behavior."""
 
@@ -42,7 +46,7 @@ class _MessageMiddlewareRabbitMQ:
             raise MessageMiddlewareDisconnectedError(
                 "Could not connect to RabbitMQ"
             ) from error
-        except pika.exceptions.AMQPError as error:
+        except Exception as error:
             self._cleanup_after_setup_failure(error)
             raise MessageMiddlewareMessageError(
                 "Could not initialize the RabbitMQ channel"
@@ -70,16 +74,27 @@ class _MessageMiddlewareRabbitMQ:
             )
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
-        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+        except Exception as error:
+            self._cleanup_after_setup_failure(error)
             self._raise_message_error("Could not register the consumer", error)
 
         self._is_consuming = True
         try:
             self._channel.start_consuming()
+        except _CallbackError as error:
+            original_error = error.args[0]
+            self._cleanup_after_setup_failure(original_error)
+            raise original_error from original_error.__cause__
         except _CONNECTION_ERRORS as error:
+            self._cleanup_after_setup_failure(error)
             self._raise_disconnected(error)
-        except pika.exceptions.AMQPError as error:
+        except Exception as error:
+            self._cleanup_after_setup_failure(error)
             self._raise_message_error("Could not consume messages", error)
+        except BaseException as error:
+            # Clean up on interruption without translating KeyboardInterrupt/SystemExit.
+            self._cleanup_after_setup_failure(error)
+            raise
         finally:
             self._is_consuming = False
 
@@ -87,13 +102,17 @@ class _MessageMiddlewareRabbitMQ:
         if not self._is_consuming:
             return
 
-        self._ensure_connection_is_open()
         try:
+            self._ensure_connection_is_open()
             self._channel.stop_consuming()
+        except MessageMiddlewareDisconnectedError:
+            raise
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
-        except pika.exceptions.AMQPError as error:
-            self._raise_message_error("Could not stop the consumer", error)
+        except Exception as error:
+            raise MessageMiddlewareCloseError(
+                "Could not stop the consumer"
+            ) from error
 
     def close(self):
         if self._connection is None or self._connection.is_closed:
@@ -111,13 +130,13 @@ class _MessageMiddlewareRabbitMQ:
             try:
                 self._channel.close()
             except Exception as error:
-                close_error = close_error or error
+                close_error = self._record_close_error(close_error, error)
 
         if self._connection.is_open:
             try:
                 self._connection.close()
             except Exception as error:
-                close_error = close_error or error
+                close_error = self._record_close_error(close_error, error)
 
         if close_error is not None:
             raise MessageMiddlewareCloseError(
@@ -138,7 +157,7 @@ class _MessageMiddlewareRabbitMQ:
             )
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
-        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+        except Exception as error:
             self._raise_message_error("Could not publish the message", error)
 
     def _build_message_callback(self, on_message_callback):
@@ -151,7 +170,10 @@ class _MessageMiddlewareRabbitMQ:
             def nack():
                 self._reject(channel, delivery_tag)
 
-            on_message_callback(body, ack, nack)
+            try:
+                on_message_callback(body, ack, nack)
+            except Exception as error:
+                raise _CallbackError(error) from error
 
         return callback
 
@@ -160,7 +182,7 @@ class _MessageMiddlewareRabbitMQ:
             channel.basic_ack(delivery_tag=delivery_tag)
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
-        except pika.exceptions.AMQPError as error:
+        except Exception as error:
             self._raise_message_error("Could not acknowledge the message", error)
 
     def _reject(self, channel, delivery_tag):
@@ -171,7 +193,7 @@ class _MessageMiddlewareRabbitMQ:
             )
         except _CONNECTION_ERRORS as error:
             self._raise_disconnected(error)
-        except pika.exceptions.AMQPError as error:
+        except Exception as error:
             self._raise_message_error("Could not reject the message", error)
 
     def _ensure_connection_is_open(self):
@@ -192,9 +214,16 @@ class _MessageMiddlewareRabbitMQ:
             self._connection.close()
         except Exception as cleanup_error:
             original_error.add_note(
-                f"The partially opened connection could not be closed: "
+                f"The connection could not be closed after failure: "
                 f"{cleanup_error}"
             )
+
+    @staticmethod
+    def _record_close_error(first_error, error):
+        if first_error is None:
+            return error
+        first_error.add_note(f"Additional error during close: {error!r}")
+        return first_error
 
     @staticmethod
     def _raise_disconnected(error):
@@ -226,7 +255,7 @@ class MessageMiddlewareQueueRabbitMQ(
         except _CONNECTION_ERRORS as error:
             self._cleanup_after_setup_failure(error)
             self._raise_disconnected(error)
-        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+        except Exception as error:
             self._cleanup_after_setup_failure(error)
             self._raise_message_error("Could not declare the queue", error)
 
@@ -247,7 +276,7 @@ class MessageMiddlewareExchangeRabbitMQ(
 
         try:
             routing_keys = tuple(dict.fromkeys(routing_keys))
-        except (TypeError, ValueError) as error:
+        except Exception as error:
             raise MessageMiddlewareMessageError(
                 "Routing keys must be an iterable of strings"
             ) from error
@@ -273,7 +302,7 @@ class MessageMiddlewareExchangeRabbitMQ(
         except _CONNECTION_ERRORS as error:
             self._cleanup_after_setup_failure(error)
             self._raise_disconnected(error)
-        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+        except Exception as error:
             self._cleanup_after_setup_failure(error)
             self._raise_message_error("Could not declare the exchange", error)
 
@@ -282,6 +311,7 @@ class MessageMiddlewareExchangeRabbitMQ(
         super().start_consuming(on_message_callback)
 
     def send(self, message):
+        self._ensure_connection_is_open()
         for routing_key in self._routing_keys:
             self._publish_message(self._exchange_name, routing_key, message)
 
@@ -309,8 +339,10 @@ class MessageMiddlewareExchangeRabbitMQ(
             self._channel.basic_qos(prefetch_count=_PREFETCH_COUNT)
             self._consumer_queue_name = queue_name
         except _CONNECTION_ERRORS as error:
+            self._cleanup_after_setup_failure(error)
             self._raise_disconnected(error)
-        except (pika.exceptions.AMQPError, TypeError, ValueError) as error:
+        except Exception as error:
+            self._cleanup_after_setup_failure(error)
             self._raise_message_error(
                 "Could not configure the exchange consumer", error
             )

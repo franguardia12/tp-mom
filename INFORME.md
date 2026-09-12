@@ -83,6 +83,9 @@ Los errores de Pika se traducen a las excepciones definidas por la interfaz:
   informan como `MessageMiddlewareMessageError`.
 - Los errores ocurridos al liberar recursos se informan como
   `MessageMiddlewareCloseError`.
+- En `stop_consuming()`, una desconexión se informa como
+  `MessageMiddlewareDisconnectedError`; los demás fallos de detención, incluido
+  un canal cerrado, como `MessageMiddlewareCloseError`.
 
 Las excepciones traducidas conservan el error original como causa mediante
 encadenamiento de excepciones. Si falla la inicialización después de abrir una
@@ -91,7 +94,20 @@ error original en lugar de ocultarlo.
 
 Las excepciones producidas por el callback de la aplicación no se capturan como
 errores internos del middleware, ya que hacerlo ocultaría un fallo ajeno a la
-abstracción de comunicación.
+abstracción de comunicación. Se identifican en el adaptador del callback para
+preservar su identidad incluso si su tipo coincide con una excepción de Pika.
+Los errores de ACK/NACK ya traducidos también conservan su tipo y causa.
+
+Las operaciones internas capturan las desconexiones antes de una captura general
+de `Exception`, que traduce los restantes errores ordinarios sin silenciarlos.
+Si falla el consumo o la configuración de la cola privada, se intenta cerrar la
+conexión para liberar los recursos y las entregas pendientes. Después de esa
+salida por error debe crearse una nueva instancia. La detención normal conserva
+la conexión y permite volver a consumir. Las interrupciones como
+`KeyboardInterrupt` y `SystemExit` provocan limpieza al salir del bucle de consumo
+y se propagan sin convertirse en errores del middleware. Si varias operaciones
+de cierre fallan, se conserva la primera causa y se agregan las siguientes como
+notas.
 
 `MessageMiddlewareDeleteError` está declarado en el archivo de interfaces, pero
 ningún método abstracto solicita eliminar una cola o un exchange ni documenta
@@ -118,8 +134,7 @@ con las restricciones de `BlockingConnection` de Pika.
   utilizan los valores predeterminados de Pika porque la interfaz no permite
   configurarlos.
 - Se utilizan únicamente colas clásicas, exchanges directos y operaciones AMQP
-  básicas. No se emplean quorum queues, dead-letter exchanges, plugins ni otras
-  funcionalidades específicas de RabbitMQ.
+  básicas.
 - No se implementan reconexiones ni reintentos automáticos. Ante una desconexión
   se informa el error correspondiente para evitar ocultar fallos o introducir
   duplicaciones mediante reintentos no solicitados.
